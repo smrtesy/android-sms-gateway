@@ -9,6 +9,13 @@ enum class WebHookEvent(val value: String) {
     @SerializedName("sms:sent")
     SmsSent("sms:sent"),
 
+    // Fired by SentSmsContentObserver for a message the user sent manually from
+    // the phone's default messaging app (observed in content://sms/sent).
+    // Distinct from `sms:sent`, which is a state transition on the app's OWN
+    // outbox rows and carries an internal message id.
+    @SerializedName("sms:sent-observed")
+    SmsSentObserved("sms:sent-observed"),
+
     @SerializedName("sms:delivered")
     SmsDelivered("sms:delivered"),
 

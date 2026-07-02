@@ -1,0 +1,86 @@
+name: Build Debug APK (fork)
+
+# Builds a self-signed, installable debug APK with no repo secrets, so the
+# maintainer can grab an artifact without Android Studio. Separate from the
+# upstream `build-apk.yml` (a reusable workflow needing GOOGLE_SERVICES_JSON +
+# a signing keystore) so it keeps working on this fork with zero configuration.
+#
+# The app applies the `com.google.gms.google-services` plugin unconditionally
+# and `google-services.json` is git-ignored, so Gradle configuration fails
+# without it. We write a syntactically-valid DUMMY google-services.json before
+# building: Firebase initializes against a non-existent project (FCM/cloud mode
+# just fails silently in the background), which is fine because this fork is
+# used in local-server mode only.
+
+on:
+  push:
+    branches:
+      - "claude/**"
+  workflow_dispatch:
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Cache Gradle and wrapper
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Write dummy google-services.json
+        run: |
+          cat > app/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "smsgateway-fork-debug",
+              "storage_bucket": "smsgateway-fork-debug.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "me.capcom.smsgateway"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  { "current_key": "AIzaSyDUMMYDUMMYDUMMYDUMMYDUMMYDUMMY000" }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          JSON
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

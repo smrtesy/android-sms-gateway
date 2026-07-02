@@ -54,4 +54,17 @@ sealed class SmsEventPayload(
         val data: String,
         val receivedAt: Date,
     ) : SmsEventPayload(messageId, sender, recipient, simNumber, sender)
+
+    /**
+     * A message the user sent manually from the phone's messaging app, picked up
+     * by SentSmsContentObserver from content://sms/sent. Carries the body (unlike
+     * [SmsSent]) so the consumer can ingest the outgoing message content.
+     */
+    class SmsSentObserved(
+        messageId: String,
+        recipient: String,
+        simNumber: Int?,
+        val message: String,
+        val sentAt: Date,
+    ) : SmsEventPayload(messageId, null, recipient, simNumber, recipient)
 }
