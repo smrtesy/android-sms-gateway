@@ -16,6 +16,13 @@ enum class WebHookEvent(val value: String) {
     @SerializedName("sms:sent-observed")
     SmsSentObserved("sms:sent-observed"),
 
+    // Fired by SentMmsContentObserver for an MMS the user sent manually from the
+    // phone's default messaging app (observed in content://mms, msg_box = sent).
+    // The stock app only knows MMS it downloaded (incoming); a manual outgoing
+    // MMS has no app row and fires no event.
+    @SerializedName("mms:sent-observed")
+    MmsSentObserved("mms:sent-observed"),
+
     @SerializedName("sms:delivered")
     SmsDelivered("sms:delivered"),
 

@@ -18,11 +18,16 @@ class StateStorage(
         get() = storage.get<Long>(SMS_SENT_LAST_PROCESSED_ID) ?: 0
         set(value) = storage.set(SMS_SENT_LAST_PROCESSED_ID, value)
 
+    var mmsSentLastProcessedID: Long
+        get() = storage.get<Long>(MMS_SENT_LAST_PROCESSED_ID) ?: 0
+        set(value) = storage.set(MMS_SENT_LAST_PROCESSED_ID, value)
+
     companion object {
         private val PREFIX = "state."
 
         private val MMS_LAST_PROCESSED_ID = PREFIX + "last_processed_id"
         private val SMS_LAST_PROCESSED_ID = PREFIX + "sms_last_processed_id"
         private val SMS_SENT_LAST_PROCESSED_ID = PREFIX + "sms_sent_last_processed_id"
+        private val MMS_SENT_LAST_PROCESSED_ID = PREFIX + "mms_sent_last_processed_id"
     }
 }
