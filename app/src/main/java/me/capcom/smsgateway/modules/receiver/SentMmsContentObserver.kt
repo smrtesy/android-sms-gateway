@@ -26,13 +26,19 @@ import org.koin.core.component.inject
  *
  * Mirrors [SentSmsContentObserver] and [MmsContentObserver]: registers on
  * content://mms, picks up sent-box rows with `_id` above a persisted
- * high-water mark, and emits an `mms:sent-observed` webhook for each. Reuses
- * [MmsContentReader] for the body/subject/date and reads the TO address
- * (type 151) itself, since the reader resolves the FROM address (sender), which
- * for an outgoing message is the user's own line.
+ * high-water mark, reuses [MmsContentReader] for the body/subject/date, reads
+ * the TO address (type 151) itself (the reader resolves the FROM address, which
+ * for an outgoing message is the user's own line), and emits an
+ * `mms:sent-observed` webhook.
  *
- * Sent rows (msg_box = 2) never collide with the incoming MMS observer's rows
- * (msg_box = 1) despite sharing the `_id` sequence; each keeps its own mark.
+ * MMS is written to the provider in stages: the message row can appear (and
+ * flip to msg_box = 2) a beat before its `addr` (recipient) and `part` (body)
+ * child rows are committed. Reading on that first onChange yields a null
+ * recipient/body. So a row that isn't fully readable yet is LEFT for the next
+ * onChange (the mark is not advanced past it) rather than skipped-and-lost;
+ * a row still unreadable after [GIVE_UP_MS] is abandoned so a permanently
+ * malformed row can't wedge the queue. Re-emitting a later row while waiting is
+ * harmless — the consumer upserts on messageId.
  */
 class SentMmsContentObserver : KoinComponent {
     private val context: Context by inject()
@@ -81,6 +87,13 @@ class SentMmsContentObserver : KoinComponent {
             obs,
         )
 
+        logsService.insert(
+            LogEntry.Priority.INFO,
+            MODULE_NAME,
+            "MMS sent observer started",
+            mapOf("mark" to storage.mmsSentLastProcessedID),
+        )
+
         // Catch up rows sent while the app process was stopped (edge-triggered).
         handler.post { processNewMessages() }
     }
@@ -127,11 +140,12 @@ class SentMmsContentObserver : KoinComponent {
         }
 
         val mark = storage.mmsSentLastProcessedID
-        // msg_box 2 = sent
+        // msg_box 2 = sent. `date` (seconds) drives the give-up window for rows
+        // whose child tables never finish populating.
         val cursor = try {
             context.contentResolver.query(
                 Uri.parse("content://mms"),
-                arrayOf("_id"),
+                arrayOf("_id", "date"),
                 "_id > ? AND msg_box = 2",
                 arrayOf(mark.toString()),
                 "_id ASC",
@@ -146,27 +160,82 @@ class SentMmsContentObserver : KoinComponent {
             return
         } ?: return
 
-        cursor.use { c ->
-            while (c.moveToNext()) {
-                val mmsId = c.getLong(0)
-                try {
-                    emitSentObserved(mmsId)
-                } catch (e: Exception) {
-                    logsService.insert(
-                        LogEntry.Priority.ERROR,
-                        MODULE_NAME,
-                        "Failed processing sent MMS (id=$mmsId)",
-                        mapOf("mmsId" to mmsId, "error" to (e.message ?: e.toString())),
-                    )
-                }
-                storage.mmsSentLastProcessedID = mmsId
+        // Collect first so the cursor is closed before we do per-row provider
+        // reads (each of which opens more cursors).
+        val rows = cursor.use { c ->
+            val out = mutableListOf<Pair<Long, Long>>()
+            while (c.moveToNext()) out.add(c.getLong(0) to c.getLong(1))
+            out
+        }
+
+        if (rows.isEmpty()) return
+        logsService.insert(
+            LogEntry.Priority.INFO,
+            MODULE_NAME,
+            "Found ${rows.size} new sent-MMS row(s) to process",
+            mapOf("mark" to mark, "ids" to rows.map { it.first }),
+        )
+
+        var newMark = mark
+        for ((mmsId, dateSeconds) in rows) {
+            val emitted = try {
+                emitSentObserved(mmsId)
+            } catch (e: Exception) {
+                logsService.insert(
+                    LogEntry.Priority.ERROR,
+                    MODULE_NAME,
+                    "Failed processing sent MMS (id=$mmsId)",
+                    mapOf("mmsId" to mmsId, "error" to (e.message ?: e.toString())),
+                )
+                // Treat as processed so one bad row can't wedge the queue.
+                true
             }
+
+            if (emitted) {
+                newMark = mmsId
+                continue
+            }
+
+            // Not readable yet. Give the provider time to finish writing the
+            // addr/part rows: leave the mark before this id so the next onChange
+            // retries. Abandon only once the row is older than the grace window.
+            val ageMs = nowMs() - dateSeconds * 1000
+            if (ageMs > GIVE_UP_MS) {
+                logsService.insert(
+                    LogEntry.Priority.WARN,
+                    MODULE_NAME,
+                    "Abandoning unreadable sent MMS (id=$mmsId) after ${ageMs}ms",
+                    mapOf("mmsId" to mmsId),
+                )
+                newMark = mmsId
+                continue
+            }
+
+            logsService.insert(
+                LogEntry.Priority.INFO,
+                MODULE_NAME,
+                "Sent MMS (id=$mmsId) not fully written yet; will retry on next change",
+                mapOf("mmsId" to mmsId, "ageMs" to ageMs),
+            )
+            break
+        }
+
+        if (newMark != mark) {
+            storage.mmsSentLastProcessedID = newMark
         }
     }
 
-    private fun emitSentObserved(mmsId: Long) {
-        val message = MmsContentReader.read(context, mmsId) ?: return
-        val recipient = readRecipient(mmsId) ?: return
+    /** @return true if the MMS was read and a webhook emitted; false if the row
+     *  is not yet fully written (recipient/body missing) and should be retried. */
+    private fun emitSentObserved(mmsId: Long): Boolean {
+        val message = MmsContentReader.read(context, mmsId)
+        val recipient = readRecipient(mmsId)
+        val body = message?.body ?: message?.subject
+        // Recipient is required to route the thread; body may legitimately be
+        // empty for a pure-attachment MMS, so only the recipient gates readiness.
+        if (message == null || recipient.isNullOrBlank()) {
+            return false
+        }
 
         val simSlotIndex = message.subscriptionId?.let {
             SubscriptionsHelper.getSimSlotIndex(context, it)
@@ -182,10 +251,17 @@ class SentMmsContentObserver : KoinComponent {
                 messageId = mmsId.toString(),
                 recipient = recipient,
                 simNumber = simNumber,
-                message = message.body ?: message.subject ?: "",
+                message = body ?: "",
                 sentAt = message.date,
             ),
         )
+        logsService.insert(
+            LogEntry.Priority.INFO,
+            MODULE_NAME,
+            "Emitted mms:sent-observed (id=$mmsId)",
+            mapOf("mmsId" to mmsId, "recipient" to recipient, "hasBody" to (body != null)),
+        )
+        return true
     }
 
     /** The TO address (type 151) of an outgoing MMS; first non-blank recipient. */
@@ -209,7 +285,15 @@ class SentMmsContentObserver : KoinComponent {
         android.Manifest.permission.READ_SMS,
     ) == PackageManager.PERMISSION_GRANTED
 
+    // System.currentTimeMillis via a helper so the intent is explicit.
+    private fun nowMs(): Long = System.currentTimeMillis()
+
     companion object {
         private const val TAG = "SentMmsContentObserver"
+
+        // How long to keep retrying an MMS whose addr/part rows never finish
+        // committing before abandoning it (so a malformed row can't wedge the
+        // queue). Generous — a normal MMS is fully written within seconds.
+        private const val GIVE_UP_MS = 5 * 60 * 1000L
     }
 }
